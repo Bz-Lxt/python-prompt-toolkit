@@ -5,6 +5,8 @@ Wrapper for the layout.
 from __future__ import annotations
 
 from collections.abc import Generator, Iterable
+from enum import Enum
+from typing import TYPE_CHECKING
 
 from prompt_toolkit.buffer import Buffer
 
@@ -17,13 +19,30 @@ from .containers import (
 )
 from .controls import BufferControl, SearchBufferControl, UIControl
 
+if TYPE_CHECKING:
+    from .screen import WritePosition
+
 __all__ = [
     "Layout",
     "InvalidLayoutError",
+    "FocusDirection",
     "walk",
 ]
 
 FocusableElement = str | Buffer | UIControl | AnyContainer
+
+
+class FocusDirection(Enum):
+    """
+    Screen direction for geometric (spatial) focus movement between windows.
+
+    Used by :meth:`Layout.focus_neighboring_window`.
+    """
+
+    UP = "UP"
+    DOWN = "DOWN"
+    LEFT = "LEFT"
+    RIGHT = "RIGHT"
 
 
 class Layout:
@@ -70,6 +89,13 @@ class Layout:
 
         # List of visible windows.
         self.visible_windows: list[Window] = []  # List of `Window` objects.
+
+        # Geometry of the visible windows, as recorded during the last render.
+        # Maps each visible `Window` to its absolute `WritePosition` on the
+        # screen. Used for geometric (spatial) focus movement. The mapping is
+        # refreshed on every render, so it always follows size changes and
+        # windows being added or removed.
+        self.visible_windows_to_write_positions: dict[Window, WritePosition] = {}
 
     def __repr__(self) -> str:
         return f"Layout({self.container!r}, current_window={self.current_window!r})"
@@ -335,6 +361,59 @@ class Layout:
 
             self.focus(windows[index])
 
+    def focus_neighboring_window(self, direction: FocusDirection | str) -> None:
+        """
+        Focus the visible/focusable :class:`.Window` that is geometrically
+        nearest to the currently focused window in the given screen direction.
+
+        Unlike :meth:`focus_next` (which follows tab order), this uses the
+        actual window geometry (`WritePosition`) from the last render, so it
+        keeps working after floats appear or move, sizes change and windows
+        are added or removed.
+
+        Only windows inside the current modal area are considered, so focus
+        never leaves a modal container (such as a modal floating dialog).
+
+        When several windows are equally near, the one that aligns best with
+        the current window is chosen, with reading order and the stable
+        layout traversal order as tie-breakers.
+
+        When no window lies in the given direction (or the current window has
+        no rendered geometry yet), the focus is left untouched.
+
+        :param direction: A :class:`FocusDirection` value, or one of the
+            strings ``"up"``, ``"down"``, ``"left"`` or ``"right"``.
+        """
+        if isinstance(direction, str):
+            direction = FocusDirection(direction.upper())
+
+        positions = self.visible_windows_to_write_positions
+
+        # Without geometry for the current window (nothing rendered yet, or
+        # the focused window was hidden/removed since the last render), we
+        # cannot reason about direction: retain the focus.
+        origin = positions.get(self.current_window)
+        if origin is None:
+            return
+
+        best_window: Window | None = None
+        best_key: tuple[int, ...] | None = None
+
+        # `get_visible_focusable_windows` walks through the current modal
+        # area, filtered by visibility, and keeps a stable traversal order.
+        for index, window in enumerate(self.get_visible_focusable_windows()):
+            target = positions.get(window)
+            if target is None:
+                continue
+
+            key = _neighboring_window_key(direction, origin, target, index)
+            if key is not None and (best_key is None or key < best_key):
+                best_key = key
+                best_window = window
+
+        if best_window is not None:
+            self.focus(best_window)
+
     def walk(self) -> Iterable[Container]:
         """
         Walk through all the layout nodes (and their children) and yield them.
@@ -410,3 +489,96 @@ def walk(container: Container, skip_hidden: bool = False) -> Iterable[Container]
     for c in container.get_children():
         # yield from walk(c)
         yield from walk(c, skip_hidden=skip_hidden)
+
+
+def _distance_point_to_interval(point: int, start: int, length: int) -> int:
+    """
+    Return the distance in cells from a single cell position `point` to the
+    closest cell in the half-open interval `[start, start + length)`.
+
+    Returns zero when `point` lies inside the interval.
+    """
+    end = start + length
+    if point < start:
+        return start - point
+    if point >= end:
+        return point - end + 1
+    return 0
+
+
+def _neighboring_window_key(
+    direction: FocusDirection,
+    origin: WritePosition,
+    target: WritePosition,
+    index: int,
+) -> tuple[int, ...] | None:
+    """
+    Calculate a comparable sort key for `target` as a neighbor of `origin` in
+    the given `direction`.
+
+    Return `None` when `target` does not lie in that direction (e.g. it is at
+    the same position or on the wrong side).
+
+    The primary key is the squared Euclidean distance from the midpoint of the
+    origin's edge (on the movement side) to the closest point of the target.
+    Overlapping rectangles (as produced by floats) count as zero gap. The
+    remaining components deterministically resolve equal distances: first the
+    distance orthogonal to the movement direction (alignment), then reading
+    order (top-to-bottom, left-to-right), and finally the stable traversal
+    `index`.
+    """
+    o_right = origin.xpos + origin.width
+    o_bottom = origin.ypos + origin.height
+    t_right = target.xpos + target.width
+    t_bottom = target.ypos + target.height
+
+    # A target counts as lying in a direction when its center is strictly on
+    # that side of the origin's center. (Comparisons are doubled to avoid
+    # fractions.) This also accepts targets that geometrically overlap the
+    # origin, as produced by floats inside a large background window.
+    o_center_x2 = 2 * origin.xpos + origin.width
+    o_center_y2 = 2 * origin.ypos + origin.height
+    t_center_x2 = 2 * target.xpos + target.width
+    t_center_y2 = 2 * target.ypos + target.height
+
+    # `axial` is the gap along the movement direction (zero when overlapping).
+    # `orthogonal` is the distance from the origin midpoint to the target's
+    # span on the other axis.
+    if direction == FocusDirection.RIGHT:
+        if t_center_x2 <= o_center_x2:
+            return None
+
+        axial = max(0, target.xpos - o_right)
+        midpoint = origin.ypos + (origin.height - 1) // 2
+        orthogonal = _distance_point_to_interval(midpoint, target.ypos, target.height)
+        positional = (target.ypos, target.xpos)
+
+    elif direction == FocusDirection.LEFT:
+        if t_center_x2 >= o_center_x2:
+            return None
+
+        axial = max(0, origin.xpos - t_right)
+        midpoint = origin.ypos + (origin.height - 1) // 2
+        orthogonal = _distance_point_to_interval(midpoint, target.ypos, target.height)
+        positional = (target.ypos, -target.xpos)
+
+    elif direction == FocusDirection.DOWN:
+        if t_center_y2 <= o_center_y2:
+            return None
+
+        axial = max(0, target.ypos - o_bottom)
+        midpoint = origin.xpos + (origin.width - 1) // 2
+        orthogonal = _distance_point_to_interval(midpoint, target.xpos, target.width)
+        positional = (target.xpos, target.ypos)
+
+    else:  # FocusDirection.UP
+        if t_center_y2 >= o_center_y2:
+            return None
+
+        axial = max(0, origin.ypos - t_bottom)
+        midpoint = origin.xpos + (origin.width - 1) // 2
+        orthogonal = _distance_point_to_interval(midpoint, target.xpos, target.width)
+        positional = (target.xpos, -target.ypos)
+
+    distance_squared = axial * axial + orthogonal * orthogonal
+    return (distance_squared, orthogonal, *positional, index)

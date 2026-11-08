@@ -84,7 +84,7 @@ from .dimension import (
     sum_layout_dimensions,
     to_dimension,
 )
-from .layout import InvalidLayoutError, Layout, walk
+from .layout import FocusDirection, InvalidLayoutError, Layout, walk
 from .margins import (
     ConditionalMargin,
     Margin,
@@ -99,6 +99,7 @@ __all__ = [
     # Layout.
     "Layout",
     "InvalidLayoutError",
+    "FocusDirection",
     "walk",
     # Dimensions.
     "AnyDimension",

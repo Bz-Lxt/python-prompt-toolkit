@@ -726,8 +726,13 @@ class Renderer:
         # Flush buffered output.
         output.flush()
 
-        # Set visible windows in layout.
+        # Set visible windows in layout, together with their geometry. (Both
+        # are refreshed on every render, so spatial focus movement uses the
+        # up-to-date positions, also after resizes or floats moving around.)
         app.layout.visible_windows = screen.visible_windows
+        app.layout.visible_windows_to_write_positions = (
+            screen.visible_windows_to_write_positions
+        )
 
         if is_done:
             self.reset()
