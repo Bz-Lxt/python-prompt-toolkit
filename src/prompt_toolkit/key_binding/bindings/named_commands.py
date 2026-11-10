@@ -92,10 +92,7 @@ def beginning_of_line(event: E) -> None:
     """
     Move to the start of the current line.
     """
-    buff = event.current_buffer
-    buff.cursor_position += buff.document.get_start_of_line_position(
-        after_whitespace=False
-    )
+    event.current_buffer.cursor_to_start_of_line(after_whitespace=False)
 
 
 @register("end-of-line")
@@ -103,8 +100,7 @@ def end_of_line(event: E) -> None:
     """
     Move to the end of the line.
     """
-    buff = event.current_buffer
-    buff.cursor_position += buff.document.get_end_of_line_position()
+    event.current_buffer.cursor_to_end_of_line()
 
 
 @register("forward-char")
@@ -112,15 +108,15 @@ def forward_char(event: E) -> None:
     """
     Move forward a character.
     """
-    buff = event.current_buffer
-    buff.cursor_position += buff.document.get_cursor_right_position(count=event.arg)
+    # With BiDi enabled, "forward" means one cell to the visual right.
+    event.current_buffer.cursor_right(count=event.arg)
 
 
 @register("backward-char")
 def backward_char(event: E) -> None:
     "Move back a character."
-    buff = event.current_buffer
-    buff.cursor_position += buff.document.get_cursor_left_position(count=event.arg)
+    # With BiDi enabled, "backward" means one cell to the visual left.
+    event.current_buffer.cursor_left(count=event.arg)
 
 
 @register("forward-word")

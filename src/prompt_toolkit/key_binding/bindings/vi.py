@@ -457,7 +457,8 @@ def load_vi_bindings() -> KeyBindingsBase:
         vi_state = event.app.vi_state
 
         if vi_state.input_mode in (InputMode.INSERT, InputMode.REPLACE):
-            buffer.cursor_position += buffer.document.get_cursor_left_position()
+            # Move to the left cell of what is actually rendered.
+            buffer.cursor_left()
 
         vi_state.input_mode = InputMode.NAVIGATION
 
@@ -518,9 +519,7 @@ def load_vi_bindings() -> KeyBindingsBase:
         """
         In navigation-mode, move cursor.
         """
-        event.current_buffer.cursor_position += (
-            event.current_buffer.document.get_cursor_left_position(count=event.arg)
-        )
+        event.current_buffer.cursor_left(count=event.arg)
 
     @handle("c-n", filter=vi_insert_mode)
     def _complete_next(event: E) -> None:
@@ -600,16 +599,12 @@ def load_vi_bindings() -> KeyBindingsBase:
     # ~IsReadOnly, because we want to stay in navigation mode for
     # read-only buffers.
     def _a(event: E) -> None:
-        event.current_buffer.cursor_position += (
-            event.current_buffer.document.get_cursor_right_position()
-        )
+        event.current_buffer.cursor_right()
         event.app.vi_state.input_mode = InputMode.INSERT
 
     @handle("A", filter=vi_navigation_mode & ~is_read_only)
     def _A(event: E) -> None:
-        event.current_buffer.cursor_position += (
-            event.current_buffer.document.get_end_of_line_position()
-        )
+        event.current_buffer.cursor_to_end_of_line()
         event.app.vi_state.input_mode = InputMode.INSERT
 
     @handle("C", filter=vi_navigation_mode & ~is_read_only)
@@ -1246,7 +1241,10 @@ def load_vi_bindings() -> KeyBindingsBase:
         """
         'c$', 'd$' and '$':  Delete/change/move until end of line.
         """
-        return TextObject(event.current_buffer.document.get_end_of_line_position())
+        buff = event.current_buffer
+        if buff.bidi():
+            return TextObject(buff.get_visual_end_of_line_position())
+        return TextObject(buff.document.get_end_of_line_position())
 
     @text_object("w")
     def _word_forward(event: E) -> TextObject:
@@ -1350,10 +1348,11 @@ def load_vi_bindings() -> KeyBindingsBase:
         'c0', 'd0': Hard start of line, before whitespace.
         (The move '0' key is implemented elsewhere, because a '0' could also change the `arg`.)
         """
+        buff = event.current_buffer
+        if buff.bidi():
+            return TextObject(buff.get_visual_start_of_line_position())
         return TextObject(
-            event.current_buffer.document.get_start_of_line_position(
-                after_whitespace=False
-            )
+            buff.document.get_start_of_line_position(after_whitespace=False)
         )
 
     def create_ci_ca_handles(
@@ -1530,8 +1529,11 @@ def load_vi_bindings() -> KeyBindingsBase:
         """
         Implements 'ch', 'dh', 'h': Cursor left.
         """
+        buff = event.current_buffer
+        if buff.bidi():
+            return TextObject(buff.get_visual_left_position(count=event.arg))
         return TextObject(
-            event.current_buffer.document.get_cursor_left_position(count=event.arg)
+            buff.document.get_cursor_left_position(count=event.arg)
         )
 
     @text_object("j", no_move_handler=True, no_selection_handler=True)
@@ -1564,8 +1566,11 @@ def load_vi_bindings() -> KeyBindingsBase:
         """
         Implements 'cl', 'dl', 'l', 'c ', 'd ', ' '. Cursor right.
         """
+        buff = event.current_buffer
+        if buff.bidi():
+            return TextObject(buff.get_visual_right_position(count=event.arg))
         return TextObject(
-            event.current_buffer.document.get_cursor_right_position(count=event.arg)
+            buff.document.get_cursor_right_position(count=event.arg)
         )
 
     @text_object("H")

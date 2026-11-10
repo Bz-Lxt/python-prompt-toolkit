@@ -14,6 +14,12 @@ from collections.abc import Callable, Hashable
 from typing import TYPE_CHECKING, cast
 
 from prompt_toolkit.application.current import get_app
+from prompt_toolkit.bidi import (
+    analyze_line,
+    has_rtl,
+    logical_caret_to_visual,
+    visual_caret_for_column,
+)
 from prompt_toolkit.cache import SimpleCache
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import FilterOrBool, to_filter, vi_insert_multiple_mode
@@ -52,6 +58,7 @@ __all__ = [
     "TabsProcessor",
     "ReverseSearchProcessor",
     "DynamicProcessor",
+    "BiDiProcessor",
     "merge_processors",
 ]
 
@@ -947,6 +954,72 @@ class DynamicProcessor(Processor):
     def apply_transformation(self, ti: TransformationInput) -> Transformation:
         processor = self.get_processor() or DummyProcessor()
         return processor.apply_transformation(ti)
+
+
+class BiDiProcessor(Processor):
+    """
+    Reorder the logical order fragments of a line into visual order according
+    to the Unicode Bidirectional Algorithm (UAX #9).
+
+    The text stored in the :class:`~prompt_toolkit.buffer.Buffer` is never
+    modified: only the rendering order changes, through the logical/visual
+    index permutation produced by :func:`prompt_toolkit.bidi.analyze_line`.
+    The returned coordinate mappings translate cursor and mouse positions
+    between the logical text and its visual representation, so that keyboard
+    movement, mouse positioning, selection/copy and line wrapping always
+    refer to the correct characters.
+
+    The processor is a no-op for lines without right-to-left characters. It
+    is intended to be the last processor in the chain, because every other
+    processor works on logical order text and logical indices.
+
+    :param base_direction: ``"L"``, ``"R"`` or ``None`` to auto detect the
+        paragraph base direction according to rules P2/P3.
+    """
+
+    def __init__(self, base_direction: str | None = None) -> None:
+        self.base_direction = base_direction
+
+    def apply_transformation(self, ti: TransformationInput) -> Transformation:
+        # Explode first, so that every fragment character can be moved
+        # independently while retaining its style.
+        fragments = explode_text_fragments(ti.fragments)
+        line = fragment_list_to_text(fragments)
+
+        # Pure left-to-right lines do not need any reordering.
+        if not line or not has_rtl(line):
+            return Transformation(ti.fragments)
+
+        result = analyze_line(line, self.base_direction)
+
+        # Rebuild the fragments in visual order. The visual character comes
+        # from the analysis result (it may be an L4 mirrored glyph), while the
+        # style and any attached control are taken from the logical fragment.
+        visual_fragments: StyleAndTextTuples = []
+        for visual_index, logical_index in enumerate(result.visual_to_logical):
+            fragment = fragments[logical_index]
+            visual_char = result.text[visual_index]
+            if len(fragment) == 2:
+                visual_fragments.append((fragment[0], visual_char))
+            else:
+                # Preserve an optional mouse handler attached to the fragment.
+                visual_fragments.append(
+                    (fragment[0], visual_char, fragment[2])
+                )
+
+        def source_to_display(from_position: int) -> int:
+            "Map a logical caret position to its visual x position."
+            return logical_caret_to_visual(result, from_position)
+
+        def display_to_source(display_pos: int) -> int:
+            "Map a visual x position back to a logical caret position."
+            return visual_caret_for_column(result, display_pos)
+
+        return Transformation(
+            visual_fragments,
+            source_to_display=source_to_display,
+            display_to_source=display_to_source,
+        )
 
 
 def merge_processors(processors: list[Processor]) -> Processor:

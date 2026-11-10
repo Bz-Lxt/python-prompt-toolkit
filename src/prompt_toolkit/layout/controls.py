@@ -32,6 +32,7 @@ from prompt_toolkit.selection import SelectionType
 from prompt_toolkit.utils import get_cwidth
 
 from .processors import (
+    BiDiProcessor,
     DisplayMultipleCursors,
     HighlightIncrementalSearchProcessor,
     HighlightSearchProcessor,
@@ -665,6 +666,11 @@ class BufferControl(UIControl):
         input_processors = self.input_processors or []
         if self.include_default_input_processors:
             input_processors = self.default_input_processors + input_processors
+
+        # Bidirectional reordering has to be the very last transformation:
+        # every other processor works on logical order text and indices.
+        if self.buffer.bidi():
+            input_processors = input_processors + [BiDiProcessor()]
 
         merged_processor = merge_processors(input_processors)
 

@@ -22,6 +22,14 @@ from typing import Any, TypeVar, cast
 from .application.current import get_app
 from .application.run_in_terminal import run_in_terminal
 from .auto_suggest import AutoSuggest, Suggestion
+from .bidi import (
+    BidiLine,
+    BidiNavigator,
+    _carets_at_visual_x,
+    analyze_line,
+    logical_caret_to_visual,
+    visual_caret_for_column,
+)
 from .cache import FastDictCache
 from .clipboard import ClipboardData
 from .completion import (
@@ -211,6 +219,11 @@ class Buffer:
     :param multiline: :class:`~prompt_toolkit.filters.Filter` or `bool`. When
         not set, pressing `Enter` will call the `accept_handler`.  Otherwise,
         pressing `Esc-Enter` is required.
+    :param bidi: :class:`~prompt_toolkit.filters.Filter` or `bool`. When set,
+        mixed Arabic/Hebrew/English text is rendered and navigated according
+        to the Unicode Bidirectional Algorithm (UAX #9). The logical text in
+        the buffer is never modified; only the display order and the cursor,
+        mouse and selection coordinates are adapted.
     """
 
     def __init__(
@@ -229,6 +242,7 @@ class Buffer:
         accept_handler: BufferAcceptHandler | None = None,
         read_only: FilterOrBool = False,
         multiline: FilterOrBool = True,
+        bidi: FilterOrBool = False,
         max_number_of_completions: int = 10000,
         on_text_changed: BufferEventHandler | None = None,
         on_text_insert: BufferEventHandler | None = None,
@@ -242,6 +256,7 @@ class Buffer:
         validate_while_typing = to_filter(validate_while_typing)
         read_only = to_filter(read_only)
         multiline = to_filter(multiline)
+        bidi = to_filter(bidi)
 
         self.completer = completer or DummyCompleter()
         self.auto_suggest = auto_suggest
@@ -257,6 +272,9 @@ class Buffer:
         self.enable_history_search = enable_history_search
         self.read_only = read_only
         self.multiline = multiline
+        # When enabled, render and navigate the text according to the Unicode
+        # Bidirectional Algorithm. The logical text itself never changes.
+        self.bidi = bidi
         self.max_number_of_completions = max_number_of_completions
 
         # Text width. (For wrapping, used by the Vi 'gq' operator.)
@@ -329,6 +347,14 @@ class Buffer:
 
         # When doing consecutive up/down movements, prefer to stay at this column.
         self.preferred_column: int | None = None
+
+        # While BiDi is enabled, remember the visual x position of the caret
+        # across consecutive horizontal arrow presses. A logical caret can map
+        # to two visual positions at a direction-run boundary, so this state
+        # cannot be derived from the logical cursor position alone. It is
+        # lazily re-derived (and validated) whenever the cursor moved through
+        # another code path.
+        self._bidi_visual_x: int | None = None
 
         # State of complete browser
         # For interactive completion through Ctrl-N/Ctrl-P.
@@ -525,6 +551,7 @@ class Buffer:
         self.selection_state = None
         self.suggestion = None
         self.preferred_column = None
+        self._bidi_visual_x = None
 
         # fire 'on_text_changed' event.
         self.on_text_changed.fire()
@@ -546,6 +573,9 @@ class Buffer:
         # Unset preferred_column. (Will be set after the cursor movement, if
         # required.)
         self.preferred_column = None
+        # Any cursor movement that doesn't go through the BiDi navigation
+        # helpers invalidates the remembered visual position.
+        self._bidi_visual_x = None
 
         # Note that the cursor position can change if we have a selection the
         # new position of the cursor determines the end of the selection.
@@ -701,31 +731,204 @@ class Buffer:
             ]
         )
 
+    def _bidi_analyze_current_line(self) -> BidiLine:
+        """
+        Run the bidirectional algorithm on the current logical line. The
+        analysis itself is cached, so calling this for every key press is
+        cheap enough.
+        """
+        return analyze_line(self.document.current_line)
+
+    def _bidi_navigator(self) -> BidiNavigator:
+        """
+        Return a navigator positioned at the current logical caret.
+
+        The remembered visual x is reused only when it still maps back to the
+        current logical column; otherwise the caret was moved through another
+        code path (mouse click, search, text edit, ...) and the visual
+        position is re-derived from the logical caret.
+        """
+        result = self._bidi_analyze_current_line()
+        column = self.document.cursor_position_col
+        visual_x = self._bidi_visual_x
+        # A visual column can host two logical carets at a run boundary, so
+        # accept the stored position whenever the current column is one of its
+        # valid occupants, preserving which side of the boundary we are on.
+        if visual_x is not None and column in _carets_at_visual_x(result, visual_x):
+            return BidiNavigator(result, visual_x, column)
+        return BidiNavigator.for_logical_caret(result, column)
+
     def cursor_left(self, count: int = 1) -> None:
-        self.cursor_position += self.document.get_cursor_left_position(count=count)
+        if not self.bidi():
+            self.cursor_position += self.document.get_cursor_left_position(
+                count=count
+            )
+            return
+
+        # Move one cell to the visual left, while the cursor position itself
+        # stays an index in the untouched logical text.
+        navigator = self._bidi_navigator()
+        line_start = self.cursor_position - self.document.cursor_position_col
+        caret = navigator.left(count)
+        self.cursor_position = line_start + caret
+        # Re-store after the cursor setter invalidated the state.
+        self._bidi_visual_x = navigator.visual_x
 
     def cursor_right(self, count: int = 1) -> None:
-        self.cursor_position += self.document.get_cursor_right_position(count=count)
+        if not self.bidi():
+            self.cursor_position += self.document.get_cursor_right_position(
+                count=count
+            )
+            return
+
+        # Move one cell to the visual right.
+        navigator = self._bidi_navigator()
+        line_start = self.cursor_position - self.document.cursor_position_col
+        caret = navigator.right(count)
+        self.cursor_position = line_start + caret
+        # Re-store after the cursor setter invalidated the state.
+        self._bidi_visual_x = navigator.visual_x
 
     def cursor_up(self, count: int = 1) -> None:
         """(for multiline edit). Move cursor to the previous line."""
-        original_column = self.preferred_column or self.document.cursor_position_col
-        self.cursor_position += self.document.get_cursor_up_position(
-            count=count, preferred_column=original_column
-        )
+        if not self.bidi():
+            original_column = self.preferred_column or self.document.cursor_position_col
+            self.cursor_position += self.document.get_cursor_up_position(
+                count=count, preferred_column=original_column
+            )
 
-        # Remember the original column for the next up/down movement.
-        self.preferred_column = original_column
+            # Remember the original column for the next up/down movement.
+            self.preferred_column = original_column
+            return
+
+        self._cursor_vertical_bidi(-count)
 
     def cursor_down(self, count: int = 1) -> None:
         """(for multiline edit). Move cursor to the next line."""
-        original_column = self.preferred_column or self.document.cursor_position_col
-        self.cursor_position += self.document.get_cursor_down_position(
-            count=count, preferred_column=original_column
-        )
+        if not self.bidi():
+            original_column = self.preferred_column or self.document.cursor_position_col
+            self.cursor_position += self.document.get_cursor_down_position(
+                count=count, preferred_column=original_column
+            )
 
-        # Remember the original column for the next up/down movement.
-        self.preferred_column = original_column
+            # Remember the original column for the next up/down movement.
+            self.preferred_column = original_column
+            return
+
+        self._cursor_vertical_bidi(count)
+
+    def _cursor_vertical_bidi(self, row_delta: int) -> None:
+        """
+        Move the cursor up (negative ``row_delta``) or down across logical
+        lines while preserving the visual x position, so that vertical
+        movement follows what the user sees on screen rather than the
+        (possibly reordered) logical indices.
+        """
+        document = self.document
+
+        # The preferred column is stored as a visual x position while BiDi is
+        # enabled. Compute it from the current caret on the first movement.
+        if self.preferred_column is not None:
+            visual_x = self.preferred_column
+        else:
+            current_result = analyze_line(document.current_line)
+            visual_x = logical_caret_to_visual(
+                current_result, document.cursor_position_col
+            )
+
+        target_row = max(
+            0, min(document.line_count - 1, document.cursor_position_row + row_delta)
+        )
+        target_line = document.lines[target_row]
+        target_result = analyze_line(target_line)
+        target_column = visual_caret_for_column(target_result, visual_x)
+
+        self.cursor_position = document.translate_row_col_to_index(
+            target_row, target_column
+        )
+        self.preferred_column = visual_x
+        # The horizontal caret state now corresponds to the visual x on the
+        # target line; clamp it to the target line length.
+        self._bidi_visual_x = max(0, min(visual_x, len(target_result.text)))
+
+    def cursor_to_start_of_line(self, after_whitespace: bool = False) -> None:
+        """
+        Move the cursor to the start of the current line. With BiDi enabled
+        this is the visual left edge of the line; otherwise the logical start.
+        """
+        if not self.bidi() or after_whitespace:
+            self.cursor_position += self.document.get_start_of_line_position(
+                after_whitespace=after_whitespace
+            )
+            return
+
+        result = self._bidi_analyze_current_line()
+        line_start = self.cursor_position - self.document.cursor_position_col
+        self.cursor_position = line_start + visual_caret_for_column(result, 0)
+        self._bidi_visual_x = 0
+
+    def cursor_to_end_of_line(self) -> None:
+        """
+        Move the cursor to the end of the current line. With BiDi enabled this
+        is the visual right edge of the line; otherwise the logical end.
+        """
+        if not self.bidi():
+            self.cursor_position += self.document.get_end_of_line_position()
+            return
+
+        result = self._bidi_analyze_current_line()
+        line_start = self.cursor_position - self.document.cursor_position_col
+        self.cursor_position = line_start + visual_caret_for_column(
+            result, len(result.text)
+        )
+        self._bidi_visual_x = len(result.text)
+
+    # -- Relative visual offsets, mainly for Vi text objects ----------------
+
+    def get_visual_left_position(self, count: int = 1) -> int:
+        """
+        Return the relative cursor offset for a move to the visual left.
+        Mirrors :meth:`Document.get_cursor_left_position` but follows the
+        rendered (bidirectional) cell order.
+        """
+        navigator = self._bidi_navigator()
+        target = navigator.left(count)
+        # Persisting is safe: the offset is normally applied to the cursor,
+        # and the stored x maps exactly to the resulting caret. If it is not
+        # applied, the lazy validation in ``_bidi_navigator`` discards it.
+        self._bidi_visual_x = navigator.visual_x
+        return target - self.document.cursor_position_col
+
+    def get_visual_right_position(self, count: int = 1) -> int:
+        """
+        Return the relative cursor offset for a move to the visual right.
+        Mirrors :meth:`Document.get_cursor_right_position` but follows the
+        rendered (bidirectional) cell order.
+        """
+        navigator = self._bidi_navigator()
+        target = navigator.right(count)
+        self._bidi_visual_x = navigator.visual_x
+        return target - self.document.cursor_position_col
+
+    def get_visual_start_of_line_position(self) -> int:
+        """
+        Return the relative cursor offset for a move to the visual left edge
+        of the current line.
+        """
+        result = self._bidi_analyze_current_line()
+        target = visual_caret_for_column(result, 0)
+        self._bidi_visual_x = 0
+        return target - self.document.cursor_position_col
+
+    def get_visual_end_of_line_position(self) -> int:
+        """
+        Return the relative cursor offset for a move to the visual right edge
+        of the current line.
+        """
+        result = self._bidi_analyze_current_line()
+        target = visual_caret_for_column(result, len(result.text))
+        self._bidi_visual_x = len(result.text)
+        return target - self.document.cursor_position_col
 
     def auto_up(
         self, count: int = 1, go_to_start_of_line_if_history_changes: bool = False
